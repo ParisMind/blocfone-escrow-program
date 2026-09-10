@@ -41,3 +41,10 @@ jobs:
         run: |
           echo "Program: blocfone_escrow (Bff6QTTezbcfzhNtP6Gao2VtRVzXR9jdaof7aSzzAWGT)"
           solana-verify get-executable-hash target/deploy/blocfone_escrow.so
+
+      - name: Upload verified .so (for the on-chain upgrade)
+        uses: actions/upload-artifact@v4
+        with:
+          name: blocfone_escrow-verified-so
+          path: target/deploy/blocfone_escrow.so
+          if-no-files-found: error
