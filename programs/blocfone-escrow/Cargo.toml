@@ -1,0 +1,32 @@
+[package]
+name = "blocfone-escrow"
+version = "0.1.0"
+description = "blocfone® escrow (rent-vault) — single-signer USDC deposit held in a program-owned vault; oracle-gated release, permissionless-after-deadline refund, upgrade-authority-gated rent_vault withdrawal (ADR-009)"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "blocfone_escrow"
+# One source of truth: the live mainnet build, symlinked in as src/lib.rs.
+path = "src/lib.rs"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+# Pinned to match the installed anchor-cli (1.1.2) and the market program, so a
+# local `anchor idl build` and a CI reproducible build use one toolchain. The
+# deployed bytes were built by Playground on an older anchor; this build is the
+# NEW artifact we redeploy + verify in Phase 2 (Playground builds are not
+# reproducible). Discriminators and account layout are unchanged across these
+# anchor versions, so the published IDL and existing on-chain accounts stay
+# compatible after the redeploy.
+anchor-lang = { version = "1.1.2", features = ["init-if-needed"] }
+anchor-spl = "1.1.2"
+# On-chain security.txt (header-only macro; see lib.rs).
+solana-security-txt = "1.1.1"

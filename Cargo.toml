@@ -1,0 +1,14 @@
+# Rust/Anchor workspace for the escrow program (Phase 0, 2026-09-10).
+#
+# The program's source of truth stays rent-vault-mainnet-build/lib.rs (the file
+# the card4 change-workflow edits); programs/blocfone-escrow/src/lib.rs is a
+# SYMLINK to it, so this workspace builds that exact file with no second copy to
+# drift. This exists to (a) regenerate the IDL with `anchor idl build` and
+# (b) produce a reproducible verified build (solana-verify) for Phase 2 — the
+# escrow was previously only built in Solana Playground, which is not verifiable.
+[workspace]
+members = ["programs/blocfone-escrow"]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true
