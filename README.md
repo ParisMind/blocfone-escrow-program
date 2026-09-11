@@ -22,20 +22,27 @@ Instructions: `initialize`, `release`, `refund`, `withdraw_rent_vault`.
 
 ## Reproducible / verified build
 
-Requires Docker.
+✅ **Verified on mainnet (2026-09-11).** The deployed program matches this source:
+OtterSec reports `is_verified: true`, on-chain executable hash
+`6099700d3319528c4a8ee095d0f7d67a2e0c129ba325ea50b65bf451fdde4133`, built with
+base image `solanafoundation/solana-verifiable-build:4.1.1`. Status:
+https://verify.osec.io/status/Bff6QTTezbcfzhNtP6Gao2VtRVzXR9jdaof7aSzzAWGT
+
+Reproduce the build yourself (requires Docker):
 
 ```bash
 cargo install solana-verify --locked
-solana-verify build --library-name blocfone_escrow
+solana-verify build --base-image solanafoundation/solana-verifiable-build:4.1.1 --library-name blocfone_escrow
 solana-verify get-executable-hash target/deploy/blocfone_escrow.so
 ```
 
-To verify the on-chain program against this source (after the program is
-deployed from a build of this repo):
+The on-chain verification was registered with:
 
 ```bash
-solana-verify verify-from-repo -um \
+solana-verify verify-from-repo \
   --program-id Bff6QTTezbcfzhNtP6Gao2VtRVzXR9jdaof7aSzzAWGT \
+  --library-name blocfone_escrow \
+  --base-image solanafoundation/solana-verifiable-build:4.1.1 \
   https://github.com/ParisMind/blocfone-escrow-program
 ```
 
