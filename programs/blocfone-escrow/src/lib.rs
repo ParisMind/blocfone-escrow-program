@@ -72,6 +72,31 @@
 //        `Pubkey::new_from_array([..])` (const, same value).
 //    system_program::{transfer,allocate,assign} + {Transfer,Allocate,Assign},
 //    try_serialize and token::initialize_account3 all resolve unchanged.
+//
+// ✅ SIMPLE SEND (2026-09-15, owner plan v4): the buyer's transaction becomes a
+//    plain USDC transfer, and everything else is blocfone's own transaction.
+//    Root cause being fixed: Phantom's scanner blocks the paired deposit
+//    (RELIABLE_SIMULATION_NOT_POSSIBLE — an undecodable program instruction
+//    touching the buyer's USDC) on every rail. Three instructions are ADDED;
+//    initialize / release / refund / withdraw_rent_vault are untouched.
+//      • open_escrow : blocfone (a signer, paying the rent itself) announces
+//        the escrow BEFORE the buyer pays — creates the escrow state in a new
+//        `Pending` status and its vault token account (authority = escrow
+//        PDA, pinned mint). The vault address is what the buyer pays into,
+//        with one SPL transfer-checked: no program of ours in their bytes.
+//      • claim : the escrow's authority (the oracle) confirms the vault holds
+//        at least the amount and flips Pending → Funded, resetting the
+//        deadline from the moment of claim. From here release / refund run
+//        exactly as they always have. The market program reads this Funded
+//        state to open the order in the same transaction.
+//      • refund_unclaimed : the way out of Pending — the subscriber, the
+//        authority, or anyone past the deadline sends the vault back to the
+//        subscriber's USDC account and closes both accounts to rent_vault.
+//        Unclaimed money is never stranded (the BF-01 principle, again).
+//    `Pending` is APPENDED to EscrowStatus (a 1-byte enum: 0/1/2 keep their
+//    values) and every new error/event is appended, so the Escrow layout and
+//    every existing on-chain account are byte-compatible. release/refund
+//    require Funded, so a Pending vault can never be released.
 // =============================================================================
 
 use anchor_lang::prelude::*;
@@ -389,6 +414,187 @@ pub mod blocfone_escrow {
         });
         Ok(())
     }
+
+    // ── Simple send (2026-09-15) ────────────────────────────────────────────
+
+    /// Announce an escrow BEFORE the buyer pays. Creates the escrow state in
+    /// `Pending` and the vault token account the buyer will transfer into.
+    ///
+    /// TRUST: permissionless on purpose, and the PAYER funds both rents (not
+    /// rent_vault — a rent_vault-funded permissionless create would be the
+    /// BF-01 drain in a new coat). Squatting a (subscriber, order_id) pair
+    /// costs the squatter rent and gains nothing: the orders service only
+    /// hands a vault address to a buyer after ITS OWN open_escrow landed, and
+    /// picks a fresh order id if the PDA is taken. On close the rent returns
+    /// to rent_vault, as every other escrow's does.
+    pub fn open_escrow(
+        ctx: Context<OpenEscrow>,
+        order_id: u64,
+        amount: u64,
+        deadline: i64,
+    ) -> Result<()> {
+        require!(amount > 0, EscrowError::ZeroAmount);
+        let now = Clock::get()?.unix_timestamp;
+        require!(deadline >= now + MIN_LOCK_SECS, EscrowError::DeadlineTooSoon);
+        require!(deadline <= now + MAX_LOCK_SECS, EscrowError::DeadlineTooLate);
+
+        let order_bytes = order_id.to_le_bytes();
+        let escrow_key = ctx.accounts.escrow.key();
+        let escrow_seeds: &[&[u8]] = &[
+            b"escrow",
+            ctx.accounts.subscriber.key.as_ref(),
+            &order_bytes,
+            &[ctx.bumps.escrow],
+        ];
+        let vault_seeds: &[&[u8]] = &[b"vault", escrow_key.as_ref(), &[ctx.bumps.vault]];
+
+        // (1) escrow state, funded by the payer. Same hardened create as
+        // initialize (reinit refused, pre-fund tolerated).
+        let escrow_space = 8 + Escrow::INIT_SPACE;
+        create_pda_funded_by(
+            &ctx.accounts.escrow.to_account_info(),
+            escrow_seeds,
+            &ctx.accounts.payer.to_account_info(),
+            None,
+            &ctx.accounts.system_program.to_account_info(),
+            escrow_space,
+            &crate::ID,
+        )?;
+        let escrow_state = Escrow {
+            subscriber: ctx.accounts.subscriber.key(),
+            beneficiary: ctx.accounts.beneficiary.key(),
+            authority: ctx.accounts.authority.key(),
+            mint: ctx.accounts.mint.key(),
+            amount,
+            order_id,
+            deadline,
+            status: EscrowStatus::Pending,
+            bump: ctx.bumps.escrow,
+        };
+        {
+            let escrow_ai = ctx.accounts.escrow.to_account_info();
+            let mut data = escrow_ai.try_borrow_mut_data()?;
+            let mut writer: &mut [u8] = &mut data;
+            escrow_state.try_serialize(&mut writer)?;
+        }
+
+        // (2) the vault: a token account of the pinned mint whose authority is
+        // the escrow PDA — only this program, signing with the escrow seeds,
+        // can ever move what lands in it.
+        let token_program_id = ctx.accounts.token_program.key();
+        create_pda_funded_by(
+            &ctx.accounts.vault.to_account_info(),
+            vault_seeds,
+            &ctx.accounts.payer.to_account_info(),
+            None,
+            &ctx.accounts.system_program.to_account_info(),
+            TOKEN_ACCOUNT_LEN,
+            &token_program_id,
+        )?;
+        token::initialize_account3(CpiContext::new(
+            ctx.accounts.token_program.key(),
+            InitializeAccount3 {
+                account: ctx.accounts.vault.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                authority: ctx.accounts.escrow.to_account_info(),
+            },
+        ))?;
+
+        emit!(EscrowOpened {
+            escrow: escrow_key,
+            vault: ctx.accounts.vault.key(),
+            subscriber: escrow_state.subscriber,
+            order_id,
+            amount,
+            deadline,
+        });
+        Ok(())
+    }
+
+    /// The authority (oracle) recognises the buyer's transfer: the vault holds
+    /// at least the amount → Pending → Funded. The deadline is set afresh from
+    /// the moment of claim (the buyer may pay hours after open_escrow; the
+    /// settlement window must run from the money, not the announcement).
+    /// A vault holding MORE than the amount is claimed whole — release and
+    /// refund move the vault's full balance, so an overpayment reaches the
+    /// beneficiary on release or returns to the buyer on refund; the ledger
+    /// (Claimed.vault_amount) makes any excess visible for reconciliation.
+    pub fn claim(ctx: Context<Claim>, deadline: i64) -> Result<()> {
+        require!(ctx.accounts.escrow.status == EscrowStatus::Pending, EscrowError::NotPending);
+        require_keys_eq!(
+            ctx.accounts.caller.key(),
+            ctx.accounts.escrow.authority,
+            EscrowError::Unauthorized
+        );
+        require!(
+            ctx.accounts.vault.amount >= ctx.accounts.escrow.amount,
+            EscrowError::VaultUnderfunded
+        );
+        let now = Clock::get()?.unix_timestamp;
+        require!(deadline >= now + MIN_LOCK_SECS, EscrowError::DeadlineTooSoon);
+        require!(deadline <= now + MAX_LOCK_SECS, EscrowError::DeadlineTooLate);
+
+        let vault_amount = ctx.accounts.vault.amount;
+        let escrow = &mut ctx.accounts.escrow;
+        escrow.deadline = deadline;
+        escrow.status = EscrowStatus::Funded;
+
+        // The same event initialize emits — an indexer sees one "escrow is
+        // funded" signal whichever path funded it — plus the claim's own.
+        emit!(Deposited {
+            escrow: escrow.key(),
+            subscriber: escrow.subscriber,
+            amount: escrow.amount,
+        });
+        emit!(Claimed {
+            escrow: escrow.key(),
+            subscriber: escrow.subscriber,
+            amount: escrow.amount,
+            vault_amount,
+        });
+        Ok(())
+    }
+
+    /// The way out of Pending. The subscriber (it is their money), the
+    /// authority (an order that will not proceed), or anyone once the deadline
+    /// has passed (rent is always reclaimable — BF-01) sends whatever the
+    /// vault holds back to the subscriber's USDC account and closes both
+    /// accounts to rent_vault. A Funded escrow is refused here: that is
+    /// `refund`'s job, with its own rules.
+    pub fn refund_unclaimed(ctx: Context<RefundUnclaimed>) -> Result<()> {
+        require!(ctx.accounts.escrow.status == EscrowStatus::Pending, EscrowError::NotPending);
+        let now = Clock::get()?.unix_timestamp;
+        let caller = ctx.accounts.caller.key();
+        let allowed = caller == ctx.accounts.escrow.subscriber
+            || caller == ctx.accounts.escrow.authority
+            || now >= ctx.accounts.escrow.deadline;
+        require!(allowed, EscrowError::RefundNotAllowed);
+
+        let amount = ctx.accounts.vault.amount;
+        if amount > 0 {
+            transfer_out(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault,
+                &ctx.accounts.subscriber_token,
+                &ctx.accounts.escrow,
+                amount,
+            )?;
+        }
+        close_vault(
+            &ctx.accounts.token_program,
+            &ctx.accounts.vault,
+            &ctx.accounts.rent_vault.to_account_info(),
+            &ctx.accounts.escrow,
+        )?;
+
+        ctx.accounts.escrow.status = EscrowStatus::Refunded;
+        emit!(UnclaimedRefunded {
+            escrow: ctx.accounts.escrow.key(),
+            subscriber: ctx.accounts.escrow.subscriber,
+            amount,
+        });
+        Ok(())
+    }
 }
 
 // ── Helpers (transfer_out UNCHANGED; close_vault UNCHANGED — destination is now
@@ -441,6 +647,22 @@ fn create_pda_funded<'info>(
     space: usize,
     owner: &Pubkey,
 ) -> Result<()> {
+    create_pda_funded_by(target, target_seeds, funder, Some(funder_seeds), sys_prog, space, owner)
+}
+
+/// The same hardened create, with the funder either a PDA (`funder_seeds`
+/// given — rent_vault, as initialize uses it) or a plain SIGNER paying its
+/// own lamports (`None` — open_escrow's payer). Steps 1–3 are identical; only
+/// who signs the shortfall transfer differs. (2026-09-15)
+fn create_pda_funded_by<'info>(
+    target: &AccountInfo<'info>,
+    target_seeds: &[&[u8]],
+    funder: &AccountInfo<'info>,
+    funder_seeds: Option<&[&[u8]]>,
+    sys_prog: &AccountInfo<'info>,
+    space: usize,
+    owner: &Pubkey,
+) -> Result<()> {
     require!(
         *target.owner == system_program::ID && target.data_is_empty(),
         EscrowError::AlreadyInitialized
@@ -449,14 +671,17 @@ fn create_pda_funded<'info>(
     let rent = Rent::get()?.minimum_balance(space);
     let current = target.lamports();
     if current < rent {
-        system_program::transfer(
-            CpiContext::new_with_signer(
-                *sys_prog.key,
-                system_program::Transfer { from: funder.clone(), to: target.clone() },
-                &[funder_seeds],
-            ),
-            rent - current,
-        )?;
+        let accounts = system_program::Transfer { from: funder.clone(), to: target.clone() };
+        match funder_seeds {
+            Some(seeds) => system_program::transfer(
+                CpiContext::new_with_signer(*sys_prog.key, accounts, &[seeds]),
+                rent - current,
+            )?,
+            None => system_program::transfer(
+                CpiContext::new(*sys_prog.key, accounts),
+                rent - current,
+            )?,
+        }
     }
 
     system_program::allocate(
@@ -637,6 +862,99 @@ pub struct WithdrawRentVault<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Simple send (2026-09-15): announce an escrow before the money moves.
+#[derive(Accounts)]
+#[instruction(order_id: u64)]
+pub struct OpenEscrow<'info> {
+    /// Pays both rents from its own lamports (blocfone's oracle in production).
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: the buyer — NOT a signer here. Their consent is the transfer
+    /// they send into the vault (and the consent message, ADR-016).
+    pub subscriber: UncheckedAccount<'info>,
+    /// CHECK: stored only as the beneficiary (settlement vault) pubkey.
+    pub beneficiary: UncheckedAccount<'info>,
+    /// CHECK: stored only as the oracle authority pubkey — the only key that
+    /// may later `claim`.
+    pub authority: UncheckedAccount<'info>,
+
+    /// BF-07: pinned to the cluster's USDC, exactly as in initialize.
+    #[account(constraint = mint.key() == ALLOWED_MINT @ EscrowError::MintNotAllowed)]
+    pub mint: Account<'info, Mint>,
+
+    /// CHECK: created + serialized manually (funded by the payer). Address
+    /// pinned by seeds/bump — the same namespace initialize uses, so one
+    /// (subscriber, order_id) pair has exactly one escrow whichever path made it.
+    #[account(
+        mut,
+        seeds = [b"escrow", subscriber.key().as_ref(), &order_id.to_le_bytes()],
+        bump
+    )]
+    pub escrow: UncheckedAccount<'info>,
+
+    /// CHECK: created + initialized manually as a token account (funded by
+    /// the payer). Address pinned by seeds/bump. THIS is what the buyer pays into.
+    #[account(mut, seeds = [b"vault", escrow.key().as_ref()], bump)]
+    pub vault: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Simple send: Pending → Funded, authority-gated, vault balance checked.
+#[derive(Accounts)]
+pub struct Claim<'info> {
+    pub caller: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"escrow", escrow.subscriber.as_ref(), &escrow.order_id.to_le_bytes()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(
+        seeds = [b"vault", escrow.key().as_ref()],
+        bump,
+        constraint = vault.owner == escrow.key() @ EscrowError::WrongOwner,
+        constraint = vault.mint == escrow.mint @ EscrowError::WrongMint,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+}
+
+/// Simple send: the exit from Pending. Same account list as Refund, so the
+/// oracle's refund tooling needs no new shape — only the instruction differs.
+#[derive(Accounts)]
+pub struct RefundUnclaimed<'info> {
+    #[account(mut)]
+    pub caller: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"escrow", escrow.subscriber.as_ref(), &escrow.order_id.to_le_bytes()],
+        bump = escrow.bump,
+        close = rent_vault,
+    )]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(mut, seeds = [b"vault", escrow.key().as_ref()], bump)]
+    pub vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = subscriber_token.owner == escrow.subscriber @ EscrowError::WrongOwner,
+        constraint = subscriber_token.mint == escrow.mint @ EscrowError::WrongMint,
+    )]
+    pub subscriber_token: Account<'info, TokenAccount>,
+
+    /// Receives both rents. Derived (seeds), un-redirectable.
+    #[account(mut, seeds = [b"rent_vault"], bump)]
+    pub rent_vault: SystemAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
 // ── State / events / errors (UNCHANGED — no byte-layout change to Escrow) ──────
 #[account]
 #[derive(InitSpace)]
@@ -657,6 +975,10 @@ pub enum EscrowStatus {
     Funded,
     Released,
     Refunded,
+    /// Simple send (2026-09-15): announced by open_escrow, money not yet
+    /// claimed. APPENDED — 0/1/2 keep their on-chain values; release and
+    /// refund require Funded, so a Pending vault can never be released.
+    Pending,
 }
 
 #[event]
@@ -667,6 +989,20 @@ pub struct Released { pub escrow: Pubkey, pub amount: u64 }
 pub struct Refunded { pub escrow: Pubkey, pub amount: u64 }
 #[event]
 pub struct RentVaultWithdrawn { pub destination: Pubkey, pub amount: u64, pub remaining: u64 }
+// Simple send (2026-09-15) — appended.
+#[event]
+pub struct EscrowOpened {
+    pub escrow: Pubkey,
+    pub vault: Pubkey,
+    pub subscriber: Pubkey,
+    pub order_id: u64,
+    pub amount: u64,
+    pub deadline: i64,
+}
+#[event]
+pub struct Claimed { pub escrow: Pubkey, pub subscriber: Pubkey, pub amount: u64, pub vault_amount: u64 }
+#[event]
+pub struct UnclaimedRefunded { pub escrow: Pubkey, pub subscriber: Pubkey, pub amount: u64 }
 
 #[error_code]
 pub enum EscrowError {
@@ -699,4 +1035,9 @@ pub enum EscrowError {
     InsufficientRentVault, // 6011
     #[msg("Withdrawal would leave rent_vault below the rent-exempt floor — take all of it, or leave at least the floor")]
     WouldStrandRentVault, // 6012
+    // Simple send (2026-09-15) — appended.
+    #[msg("Escrow is not in the Pending state")]
+    NotPending, // 6013
+    #[msg("Vault holds less than the escrow amount — nothing to claim yet")]
+    VaultUnderfunded, // 6014
 }
